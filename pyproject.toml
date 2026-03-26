@@ -1,0 +1,8 @@
+[project]
+name = "python-crud-demo"
+version = "1.0.0"
+description = "A CRUD REST API with FastAPI, Docker, and Kubernetes"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
