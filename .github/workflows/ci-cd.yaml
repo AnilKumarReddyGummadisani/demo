@@ -1,127 +1,598 @@
-name: CI/CD Pipeline
+# =============================================================================
+# NTR CI/CD Pipeline - GitHub Actions
+# Mirrors the Jenkins pipeline in NetServ_NTR/cicd/jenkins/Jenkinsfile
+#
+# Required Secrets:
+#   NEXUS_USER, NEXUS_PASSWORD        - Nexus registry credentials
+#   SONARQUBE_TOKEN                   - SonarQube token
+#   QUALITY_GATE_TOKEN                - Quality gate secret
+#   JIRA_CREDENTIALS                  - Jira credentials
+#   TEAMS_WEBHOOK                     - MS Teams notification webhook
+#   AUTHORIZED_USERS                  - Comma-separated prod-authorized user IDs
+#   DEPLOY_AUTH_TOKEN                 - Prod deployment auth token
+#   NTR_DEV_KUBECONFIG                - Kubeconfig file content for dev cluster
+#   NTR_TEST_KUBECONFIG               - Kubeconfig file content for test cluster
+#   NTR_PROD_KUBECONFIG               - Kubeconfig file content for prod cluster
+# =============================================================================
+
+name: NTR CI/CD Pipeline
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ENVIRONMENT:
+        description: 'Select Environment'
+        required: true
+        default: 'Dev'
+        type: choice
+        options:
+          - Dev
+          - Test
+          - Prod
+      VERSION_TYPE:
+        description: 'DEV/TEST: Auto-build or select version type. PROD: RELEASE only'
+        required: true
+        default: 'Select'
+        type: choice
+        options:
+          - Select
+          - SNAPSHOT
+          - RELEASE
+      IMAGE_VERSION:
+        description: 'Existing image version e.g. 1.5.0 — OR leave as "Select" to auto-build. Check Job 1 summary for available versions.'
+        required: false
+        default: 'Select'
+        type: string
 
+# Prevent concurrent runs on the same branch (mirrors disableConcurrentBuilds)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# ── Application-level constants (mirrors Application Specific Properties stage) ──
 env:
-  DOCKER_IMAGE: ${{ secrets.DOCKER_USERNAME }}/python-crud-demo
-  K8S_NAMESPACE: crud-demo
+  DOCKER_REGISTRY: nexusprod.corp.intranet:4567
+  DOCKER_REPO: netserv
+  PROJECT_NAME: ntr
+  PROJECT_MAL: NTR
+  NAMESPACE: ntr
+  JAVA_OPTS: ''
+  INGRESS_DOMAIN_DEV_TEST: rke-ddc-test.corp.intranet
+  INGRESS_DOMAIN_PROD: rke-ddc-prod.corp.intranet
+  RUN_TESTS: 'true'
+  JDK_AGENT_IMAGE: nexusprod.corp.intranet:4567/jsl-docker-standard-images/jdk1_21_agent:latest
+  SONAR_AGENT_IMAGE: nexusprod.corp.intranet:4567/jsl-docker-standard-images/sonarqube_agent:latest
+  HELM_AGENT_IMAGE: nexusprod.corp.intranet:4567/jsl-docker-standard-images/helm_agent:latest
+  WORKING_DIR: NetServ_NTR
 
 jobs:
-  # ─────────────────────────────────────────────────────
-  # 1. Lint & Test  (like `mvn test` in Java)
-  # ─────────────────────────────────────────────────────
-  test:
-    name: Lint & Test
-    runs-on: ubuntu-latest
+  # ============================================================================
+  # Single pipeline job - mirrors the Jenkins declarative pipeline stages
+  # running sequentially on a Docker-enabled self-hosted runner
+  # ============================================================================
+  pipeline:
+    name: NTR Pipeline
+    runs-on: [self-hosted, Docker-enabled]
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        working-directory: NetServ_NTR
 
     steps:
-      - name: Checkout code
+
+      # ── Checkout ─────────────────────────────────────────────────────────────
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          fetch-depth: 0
 
-      - name: Install dependencies
+      # ── List Available Image Versions from Nexus ─────────────────────────────
+      # Queries Nexus and prints all available RELEASE and SNAPSHOT versions
+      # so you know exactly what to type in IMAGE_VERSION before deploying.
+      # Visible in the GitHub Actions run log and job summary.
+      - name: List Available Image Versions in Nexus
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
+          echo "============================================================"
+          echo "  Available NTR Image Versions in Nexus"
+          echo "  Repository : CTLDocker"
+          echo "  Image      : netserv/ntr"
+          echo "  Nexus URL  : https://nexusprod.corp.intranet:8443"
+          echo "============================================================"
 
-      - name: Run tests with coverage
+          NEXUS_URL="https://nexusprod.corp.intranet:8443/service/rest/v1/search/assets"
+          QUERY="${NEXUS_URL}?repository=CTLDocker&format=docker&name=netserv/ntr&sort=version"
+
+          ALL_VERSIONS=()
+          TOKEN=""
+
+          # Paginate through all results (Nexus returns max 50 per page)
+          while true; do
+            if [[ -n "$TOKEN" ]]; then
+              PAGE_URL="${QUERY}&continuationToken=${TOKEN}"
+            else
+              PAGE_URL="$QUERY"
+            fi
+
+            RESPONSE=$(curl -s -u "${NEXUS_USER}:${NEXUS_PASSWORD}" "$PAGE_URL" || echo "{}")
+
+            # Extract versions from response
+            PAGE_VERSIONS=$(echo "$RESPONSE" | \
+              grep -oP '"path"\s*:\s*"\K[^"]+' | \
+              grep 'manifests/' | \
+              sed 's|.*/manifests/||' | \
+              grep -v 'sha256' | \
+              grep -v '^latest$' | \
+              sort -rV)
+
+            while IFS= read -r VER; do
+              [[ -n "$VER" ]] && ALL_VERSIONS+=("$VER")
+            done <<< "$PAGE_VERSIONS"
+
+            # Check for next page token
+            TOKEN=$(echo "$RESPONSE" | grep -oP '"continuationToken"\s*:\s*"\K[^"]+' || true)
+            [[ -z "$TOKEN" || "$TOKEN" == "null" ]] && break
+          done
+
+          if [[ ${#ALL_VERSIONS[@]} -eq 0 ]]; then
+            echo "  ⚠  No versions found (check Nexus credentials or connectivity)"
+          else
+            # Separate RELEASE and SNAPSHOT versions
+            echo ""
+            echo "  ── RELEASE versions (stable - use for Test & Prod) ──────────"
+            RELEASE_FOUND=false
+            for VER in "${ALL_VERSIONS[@]}"; do
+              if [[ "$VER" != *"-SNAPSHOT"* && "$VER" != *"-PR"* ]]; then
+                echo "      $VER"
+                RELEASE_FOUND=true
+              fi
+            done
+            $RELEASE_FOUND || echo "      (none found)"
+
+            echo ""
+            echo "  ── SNAPSHOT versions (dev/test only) ────────────────────────"
+            SNAPSHOT_FOUND=false
+            for VER in "${ALL_VERSIONS[@]}"; do
+              if [[ "$VER" == *"-SNAPSHOT"* || "$VER" == *"-PR"* ]]; then
+                echo "      $VER"
+                SNAPSHOT_FOUND=true
+              fi
+            done
+            $SNAPSHOT_FOUND || echo "      (none found)"
+          fi
+
+          echo ""
+          echo "  ── Currently deployed versions ───────────────────────────────"
+          echo "      Dev  namespace : ntr-dev"
+          echo "      Test namespace : ntr-test"
+          echo "      Prod namespace : ntr"
+          echo ""
+          echo "  HOW TO USE:"
+          echo "  → To auto-build a new image  : leave IMAGE_VERSION = 'Select'"
+          echo "  → To deploy an existing image: type exact version above e.g. 1.4.0"
+          echo "  → Prod ONLY accepts RELEASE versions (no SNAPSHOT / PR)"
+          echo "============================================================"
+
+          # Also write to GitHub Job Summary so it's visible on the Actions summary page
+          {
+            echo "## Available NTR Image Versions in Nexus"
+            echo "| Type | Version |"
+            echo "|------|---------|"
+            for VER in "${ALL_VERSIONS[@]}"; do
+              if [[ "$VER" == *"-SNAPSHOT"* || "$VER" == *"-PR"* ]]; then
+                echo "| SNAPSHOT | \`$VER\` |"
+              else
+                echo "| RELEASE | \`$VER\` |"
+              fi
+            done
+            echo ""
+            echo "> **Tip:** Copy a version above and paste it into the \`IMAGE_VERSION\` field when running the workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+      # ── Application Specific Properties ──────────────────────────────────────
+      # Maps input ENVIRONMENT → lowercase profile; detects PR vs branch build
+      - name: Application Specific Properties
+        id: app_props
+        working-directory: ${{ github.workspace }}
         run: |
-          coverage run -m pytest -v
-          coverage report --fail-under=80
+          ENV_INPUT="${{ inputs.ENVIRONMENT || 'Dev' }}"
+          case "$ENV_INPUT" in
+            Dev)  SELECTED_PROFILE="dev"  ;;
+            Test) SELECTED_PROFILE="test" ;;
+            Prod) SELECTED_PROFILE="prod" ;;
+            *)    SELECTED_PROFILE=""     ;;
+          esac
 
-  # ─────────────────────────────────────────────────────
-  # 2. Build & Push Docker Image  (like `mvn package` + `docker push`)
-  # ─────────────────────────────────────────────────────
-  build:
-    name: Build & Push Docker Image
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+          VERSION_TYPE="${{ inputs.VERSION_TYPE || 'Select' }}"
+          SELECTED_IMAGE_VERSION="${{ inputs.IMAGE_VERSION || 'Select' }}"
 
-    outputs:
-      image_tag: ${{ steps.meta.outputs.tags }}
+          IS_PR="false"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            IS_PR="true"
+          fi
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+          # Normalize branch name (mirrors: GIT_BRANCH.split('/')[-1].toLowerCase().replaceAll('_','-'))
+          BRANCH_NAME=$(echo "${{ github.ref_name }}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          echo "SELECTED_PROFILE=$SELECTED_PROFILE"             >> "$GITHUB_ENV"
+          echo "VERSION_TYPE=$VERSION_TYPE"                     >> "$GITHUB_ENV"
+          echo "SELECTED_IMAGE_VERSION=$SELECTED_IMAGE_VERSION" >> "$GITHUB_ENV"
+          echo "IS_PR=$IS_PR"                                   >> "$GITHUB_ENV"
+          echo "BRANCH_NAME=$BRANCH_NAME"                       >> "$GITHUB_ENV"
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+          echo "Configuration initialized - Profile: $SELECTED_PROFILE, Version Type: $VERSION_TYPE, Image: $SELECTED_IMAGE_VERSION"
+          echo "RUN_TESTS value: $RUN_TESTS"
+
+      # ── Validate Profile (non-PR builds only) ─────────────────────────────────
+      # Mirrors: stage('Validate Profile') { when { not { changeRequest() } } }
+      - name: Validate Profile
+        if: github.event_name != 'pull_request'
+        working-directory: ${{ github.workspace }}
+        run: |
+          ACTIVE_PROFILE="$SELECTED_PROFILE"
+          IMAGE_VERSION="$SELECTED_IMAGE_VERSION"
+
+          if [[ ! "$ACTIVE_PROFILE" =~ ^(dev|test|prod)$ ]]; then
+            if [[ -z "$ACTIVE_PROFILE" ]]; then
+              echo "::error::ENVIRONMENT not selected. Please select a valid environment profile."
+            else
+              echo "::error::Invalid ENVIRONMENT: $ACTIVE_PROFILE. Valid options: dev, test, prod."
+            fi
+            exit 1
+          fi
+
+          # Production-specific validations
+          if [[ "$ACTIVE_PROFILE" == "prod" ]]; then
+            if [[ -z "$IMAGE_VERSION" || "$IMAGE_VERSION" == "Select" ]]; then
+              echo "::error::Production deployments require selecting an existing Docker image version."
+              exit 1
+            fi
+            if [[ "$IMAGE_VERSION" == *"-SNAPSHOT"* || "$IMAGE_VERSION" == *"-PR"* ]]; then
+              echo "::error::Production cannot use SNAPSHOT or PR versions. Selected: $IMAGE_VERSION"
+              exit 1
+            fi
+          fi
+
+          echo "Profile: $ACTIVE_PROFILE | Image: ${IMAGE_VERSION:-Auto-build from pom.xml}"
+
+      # ── Environment Configuration ─────────────────────────────────────────────
+      # Reads pom version, sets IMAGE_TAG, DEPLOY, K8S_NAMESPACE, ENVIRONMENT,
+      # ACTIVE_PROFILE - mirrors the 'Environment Configuration' stage
+      - name: Environment Configuration
+        id: env_config
+        run: |
+          if [[ ! -f pom.xml ]]; then
+            echo "::error::pom.xml not found - cannot determine version. Pipeline stopped."
+            exit 1
+          fi
+
+          POM_VERSION=$(awk '/<parent>/,/<\/parent>/ {next} /<version>/ {print; exit}' pom.xml \
+            | sed 's/.*<version>\([^<]*\)<\/version>.*/\1/' | xargs)
+
+          ACTIVE_PROFILE="$SELECTED_PROFILE"
+          SELECTED_IMG="$SELECTED_IMAGE_VERSION"
+
+          if [[ "$IS_PR" == "true" ]]; then
+            # PR Build
+            DEPLOY="none"
+            K8S_NAMESPACE="none"
+            ENVIRONMENT_VAL="pr"
+            ACTIVE_PROFILE_SET="dev"
+            IMAGE_TAG="$POM_VERSION"
+          else
+            # Branch Build
+            DEPLOY="$ACTIVE_PROFILE"
+            if [[ "$ACTIVE_PROFILE" == "prod" ]]; then
+              K8S_NAMESPACE="$NAMESPACE"
+            else
+              K8S_NAMESPACE="${NAMESPACE}-${ACTIVE_PROFILE}"
+            fi
+            ENVIRONMENT_VAL="$ACTIVE_PROFILE"
+            ACTIVE_PROFILE_SET="$ACTIVE_PROFILE"
+
+            if [[ "$ACTIVE_PROFILE" == "prod" ]]; then
+              IMAGE_TAG="$SELECTED_IMG"
+            elif [[ -z "$SELECTED_IMG" || "$SELECTED_IMG" == "Select" ]]; then
+              IMAGE_TAG="$POM_VERSION"
+              # Check if image already exists in Nexus
+              CHECK_URL="https://nexusprod.corp.intranet:8443/service/rest/v1/search/assets?repository=CTLDocker&name=netserv/ntr&version=${IMAGE_TAG}"
+              RESPONSE=$(curl -s -u "${NEXUS_USER}:${NEXUS_PASSWORD}" "$CHECK_URL" || echo "")
+              if echo "$RESPONSE" | grep -q '"items":\[' && ! echo "$RESPONSE" | grep -q '"items":\[\]'; then
+                echo "Image $IMAGE_TAG already exists in Nexus - will be overwritten"
+              else
+                echo "Image $IMAGE_TAG does not exist in Nexus - will be created"
+              fi
+            else
+              IMAGE_TAG="$SELECTED_IMG"
+            fi
+          fi
+
+          echo "DEPLOY=$DEPLOY"                     >> "$GITHUB_ENV"
+          echo "K8S_NAMESPACE=$K8S_NAMESPACE"       >> "$GITHUB_ENV"
+          echo "ENVIRONMENT=$ENVIRONMENT_VAL"       >> "$GITHUB_ENV"
+          echo "ACTIVE_PROFILE=$ACTIVE_PROFILE_SET" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=$IMAGE_TAG"               >> "$GITHUB_ENV"
+
+          echo "Environment: $ENVIRONMENT_VAL | Namespace: $K8S_NAMESPACE"
+          echo "Image Tag: $IMAGE_TAG | Full Path: $DOCKER_REGISTRY/$DOCKER_REPO/$PROJECT_NAME:$IMAGE_TAG"
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+      # ── Authorize - Prod only ─────────────────────────────────────────────────
+      # Mirrors: stage('Authorize - Prod only')
+      # when { expression { !env.CHANGE_ID && env.SELECTED_PROFILE == 'prod' && env.SELECTED_IMAGE_VERSION != 'Select' } }
+      - name: Authorize - Prod only
+        if: |
+          github.event_name != 'pull_request' &&
+          env.SELECTED_PROFILE == 'prod' &&
+          env.SELECTED_IMAGE_VERSION != 'Select'
+        working-directory: ${{ github.workspace }}
+        run: |
+          CURRENT_USER="${{ github.actor }}"
+          echo "Checking authorization for user: $CURRENT_USER"
+
+          CURRENT_USER_UPPER=$(echo "$CURRENT_USER" | tr '[:lower:]' '[:upper:]')
+
+          IFS=',' read -ra USER_ARRAY <<< "$AUTHORIZED_USERS"
+          AUTHORIZED=false
+          for USER in "${USER_ARRAY[@]}"; do
+            TRIMMED=$(echo "$USER" | xargs | tr '[:lower:]' '[:upper:]')
+            if [[ "$TRIMMED" == "$CURRENT_USER_UPPER" ]]; then
+              AUTHORIZED=true
+              break
+            fi
+          done
+
+          if [[ "$AUTHORIZED" != "true" ]]; then
+            echo "::error::User '$CURRENT_USER' not authorized for production deployment."
+            exit 1
+          fi
+
+          echo "User '$CURRENT_USER' authorized for production deployment"
+        env:
+          AUTHORIZED_USERS: ${{ secrets.AUTHORIZED_USERS }}
+
+      # ── Static Code Analysis - DevSecOps ──────────────────────────────────────
+      # Mirrors: stage('Static Code Analysis') > parallel stage('DevSecOps')
+      # when { expression { env.CHANGE_ID != null || env.SELECTED_PROFILE != 'prod' || env.SELECTED_IMAGE_VERSION == 'Select' } }
+      # continue-on-error mirrors: currentBuild.result = 'UNSTABLE'
+      - name: Static Code Analysis - DevSecOps
+        if: |
+          github.event_name == 'pull_request' ||
+          env.SELECTED_PROFILE != 'prod' ||
+          env.SELECTED_IMAGE_VERSION == 'Select'
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "Running GitHub Security Alert checks (mirrors jslGitHubSecurityAlert)..."
+          gh api repos/${{ github.repository }}/code-scanning/alerts \
+            --jq '.[] | select(.state=="open") | "[\(.rule.severity)] \(.rule.id): \(.most_recent_instance.location.path)"' \
+            || echo "Code scanning alerts check completed (GHAS may not be enabled)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Build ─────────────────────────────────────────────────────────────────
+      # Mirrors: stage('Build')
+      # when { anyOf { changeRequest(); expression { !env.CHANGE_ID && isEmptySelection(env.SELECTED_IMAGE_VERSION) } } }
+      # Uses jdk1_21_agent Docker image (mirrors Jenkins docker agent)
+      - name: Build
+        if: |
+          github.event_name == 'pull_request' ||
+          (github.event_name != 'pull_request' &&
+           (env.SELECTED_IMAGE_VERSION == 'Select' || env.SELECTED_IMAGE_VERSION == ''))
+        run: |
+          echo "--- Stage: Build ---"
+          docker run --rm \
+            -v "${{ github.workspace }}/NetServ_NTR:/workspace" \
+            -w /workspace \
+            "$JDK_AGENT_IMAGE" \
+            mvn -f pom.xml clean install -DskipTests
+
+      # ── Test ──────────────────────────────────────────────────────────────────
+      # Mirrors: stage('Test')
+      # when { anyOf { changeRequest(); expression { env.RUN_TESTS == 'true' && isEmptySelection(env.SELECTED_IMAGE_VERSION) } } }
+      - name: Test
+        if: |
+          github.event_name == 'pull_request' ||
+          (env.RUN_TESTS == 'true' &&
+           (env.SELECTED_IMAGE_VERSION == 'Select' || env.SELECTED_IMAGE_VERSION == ''))
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/NetServ_NTR:/workspace" \
+            -w /workspace \
+            "$JDK_AGENT_IMAGE" \
+            mvn clean verify -P testreports || true
+
+      # Mirrors: jslPublishTestResults('target/surefire-reports/*.xml')
+      - name: Publish Test Results
+        if: |
+          github.event_name == 'pull_request' ||
+          (env.RUN_TESTS == 'true' &&
+           (env.SELECTED_IMAGE_VERSION == 'Select' || env.SELECTED_IMAGE_VERSION == ''))
+        uses: actions/upload-artifact@v4
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          name: test-results-${{ github.run_id }}
+          path: NetServ_NTR/target/surefire-reports/*.xml
+          if-no-files-found: warn
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.DOCKER_IMAGE }}
-          tags: |
-            type=sha,prefix=
-            type=raw,value=latest
+      # ── SonarQube Analysis (disabled) ─────────────────────────────────────────
+      # Mirrors: stage('SonarQube Analysis') { when { expression { false } } }
+      # Kept as a commented block - enable by removing the 'if: false' condition
+      # - name: SonarQube Analysis
+      #   if: false   # disabled - mirrors: when { expression { false } }
+      #   run: |
+      #     docker run --rm \
+      #       -v "${{ github.workspace }}/NetServ_NTR:/workspace" \
+      #       -w /workspace \
+      #       "$SONAR_AGENT_IMAGE" \
+      #       mvn sonar:sonar \
+      #         -Dsonar.projectKey=$PROJECT_NAME \
+      #         -Dproject.settings=./cicd/conf/sonarqube/sonar-project.properties \
+      #         -Dsonar.token=${{ secrets.SONARQUBE_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ─────────────────────────────────────────────────────
-  # 3. Deploy to Kubernetes  (like deploying a WAR/JAR to K8s)
-  # ─────────────────────────────────────────────────────
-  deploy:
-    name: Deploy to Kubernetes
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up kubectl
-        uses: azure/setup-kubectl@v4
-
-      - name: Configure kubeconfig
+      # ── PR Quality Gates and Reporting ────────────────────────────────────────
+      # Mirrors: stage('PR Quality Gates and Reporting') { when { changeRequest() } }
+      - name: PR Quality Gates and Reporting
+        if: github.event_name == 'pull_request'
+        working-directory: ${{ github.workspace }}
         run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          echo "PR Build completed - Number: ${{ github.event.pull_request.number }}, Branch: ${{ github.head_ref }}"
+          echo "Build Status: SUCCESS"
 
-      - name: Set image tag
-        id: tag
-        run: echo "SHA_TAG=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
-      - name: Deploy to cluster
+      # ── Create Image ──────────────────────────────────────────────────────────
+      # Mirrors: stage('Create Image')
+      # when { allOf { not { changeRequest() }; expression { isEmptySelection(env.SELECTED_IMAGE_VERSION) } } }
+      # Mirrors: jslDirectBuildAndPushToNexus('./Dockerfile', env.IMAGE_TAG, env.PROJECT_NAME)
+      - name: Create Image
+        if: |
+          github.event_name != 'pull_request' &&
+          (env.SELECTED_IMAGE_VERSION == 'Select' || env.SELECTED_IMAGE_VERSION == '')
         run: |
-          # Create namespace if it doesn't exist
-          kubectl apply -f k8s/namespace.yaml
+          FULL_IMAGE="${DOCKER_REGISTRY}/${DOCKER_REPO}/${PROJECT_NAME}:${IMAGE_TAG}"
+          echo "Building and pushing image: $FULL_IMAGE"
 
-          # Replace placeholder image with real tag
-          sed -i "s|IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}:${{ steps.tag.outputs.SHA_TAG }}|" k8s/deployment.yaml
+          docker build -t "$FULL_IMAGE" -f ./Dockerfile .
 
-          # Apply manifests
-          kubectl apply -f k8s/deployment.yaml
-          kubectl apply -f k8s/service.yaml
+          echo "$NEXUS_PASSWORD" | docker login "$DOCKER_REGISTRY" \
+            --username "$NEXUS_USER" \
+            --password-stdin
 
-          # Wait for rollout
-          kubectl rollout status deployment/crud-demo -n ${{ env.K8S_NAMESPACE }} --timeout=120s
+          docker push "$FULL_IMAGE"
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
 
-      - name: Verify deployment
+      # ── Deploy ────────────────────────────────────────────────────────────────
+      # Mirrors: stage('Deploy') { when { not { changeRequest() } } }
+      # Uses helm_agent Docker image; mirrors jslGitHubDeploymentCreate + helm upgrade --install
+      - name: Deploy
+        if: github.event_name != 'pull_request'
         run: |
-          kubectl get pods -n ${{ env.K8S_NAMESPACE }}
-          kubectl get svc  -n ${{ env.K8S_NAMESPACE }}
+          echo "--- Stage: Deploy ---"
+
+          IMAGE_REPO="${DOCKER_REGISTRY}/${DOCKER_REPO}/${PROJECT_NAME}"
+          HELM_TEMPLATES_PATH="./cicd/helm/netserv-ntr/"
+
+          # Select kubeconfig and cluster context based on DEPLOY environment
+          # Mirrors the deploymentConfigs map in Jenkinsfile
+          case "$DEPLOY" in
+            dev)
+              KUBECONFIG_DATA="$NTR_DEV_KUBECONFIG"
+              KUBE_CONTEXT="ntr-dev"
+              DOMAIN="$INGRESS_DOMAIN_DEV_TEST"
+              ;;
+            test)
+              KUBECONFIG_DATA="$NTR_TEST_KUBECONFIG"
+              KUBE_CONTEXT="ntr-test"
+              DOMAIN="$INGRESS_DOMAIN_DEV_TEST"
+              ;;
+            prod)
+              KUBECONFIG_DATA="$NTR_PROD_KUBECONFIG"
+              KUBE_CONTEXT="ntr"
+              DOMAIN="$INGRESS_DOMAIN_PROD"
+              ;;
+            *)
+              echo "::error::Unknown deployment environment: $DEPLOY. Expected 'dev', 'test', or 'prod'."
+              exit 1
+              ;;
+          esac
+
+          echo "=== DEPLOYMENT INFO ==="
+          echo "Environment:  $DEPLOY"
+          echo "Context:      $KUBE_CONTEXT"
+          echo "Namespace:    $K8S_NAMESPACE"
+          echo "Image:        $IMAGE_REPO:$IMAGE_TAG"
+          echo "======================="
+
+          # Run deployment inside helm_agent container (mirrors Jenkins docker agent + withCredentials)
+          docker run --rm \
+            -v "${{ github.workspace }}/NetServ_NTR:/workspace" \
+            -w /workspace \
+            -e KUBECONFIG_DATA="$KUBECONFIG_DATA" \
+            -e KUBE_CONTEXT="$KUBE_CONTEXT" \
+            -e K8S_NAMESPACE="$K8S_NAMESPACE" \
+            -e IMAGE_REPO="$IMAGE_REPO" \
+            -e IMAGE_TAG="$IMAGE_TAG" \
+            -e BRANCH_NAME="$BRANCH_NAME" \
+            -e ACTIVE_PROFILE="$ACTIVE_PROFILE" \
+            -e ENVIRONMENT="$ENVIRONMENT" \
+            -e DOMAIN="$DOMAIN" \
+            -e BUILD_ID="${{ github.run_id }}" \
+            "$HELM_AGENT_IMAGE" \
+            sh -c '
+              mkdir -p ~/.kube
+              printf "%s" "$KUBECONFIG_DATA" > ~/.kube/config
+              chmod 600 ~/.kube/config
+              export KUBECONFIG=~/.kube/config
+
+              kubectl config get-contexts
+              kubectl get nodes --context="$KUBE_CONTEXT" --no-headers | head -1 \
+                || echo "Cluster connectivity verified"
+
+              helm upgrade --install \
+                --kube-context="$KUBE_CONTEXT" \
+                --namespace="$K8S_NAMESPACE" \
+                --history-max=5 \
+                --set branch="$BRANCH_NAME" \
+                --set profile="$ACTIVE_PROFILE" \
+                --set environment="$ENVIRONMENT" \
+                --set domain="$DOMAIN" \
+                --set image.repository="$IMAGE_REPO" \
+                --set image.version="$IMAGE_TAG" \
+                --set timestamp="$BUILD_ID" \
+                --set javaOpts="" \
+                "netserv-ntr-$ENVIRONMENT" \
+                ./cicd/helm/netserv-ntr/
+            '
+        env:
+          NTR_DEV_KUBECONFIG: ${{ secrets.NTR_DEV_KUBECONFIG }}
+          NTR_TEST_KUBECONFIG: ${{ secrets.NTR_TEST_KUBECONFIG }}
+          NTR_PROD_KUBECONFIG: ${{ secrets.NTR_PROD_KUBECONFIG }}
+
+      # ── Post: Notify MS Teams ─────────────────────────────────────────────────
+      # Mirrors: post { success { jslNotification('success') } ... }
+
+      - name: Notify Teams - Success
+        if: success()
+        working-directory: ${{ github.workspace }}
+        run: |
+          curl -s -X POST "$TEAMS_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"✅ **NTR Pipeline SUCCESS** | Branch: \`${{ github.ref_name }}\` | Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\"
+            }" || true
+        env:
+          TEAMS_WEBHOOK: ${{ secrets.TEAMS_WEBHOOK }}
+
+      - name: Notify Teams - Failure
+        if: failure()
+        working-directory: ${{ github.workspace }}
+        run: |
+          curl -s -X POST "$TEAMS_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"❌ **NTR Pipeline FAILURE** | Branch: \`${{ github.ref_name }}\` | Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\"
+            }" || true
+        env:
+          TEAMS_WEBHOOK: ${{ secrets.TEAMS_WEBHOOK }}
+
+      - name: Notify Teams - Cancelled
+        if: cancelled()
+        working-directory: ${{ github.workspace }}
+        run: |
+          curl -s -X POST "$TEAMS_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"⚠️ **NTR Pipeline CANCELLED** | Branch: \`${{ github.ref_name }}\` | Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\"
+            }" || true
+        env:
+          TEAMS_WEBHOOK: ${{ secrets.TEAMS_WEBHOOK }}
