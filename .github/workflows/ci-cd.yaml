@@ -75,7 +75,7 @@ jobs:
   # ============================================================================
   pipeline:
     name: NTR Pipeline
-    runs-on: [self-hosted, Docker-enabled]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
 
     defaults:
