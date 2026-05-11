@@ -1,6 +1,7 @@
 ﻿# Migrated from Jenkinsfile: monitoring-service-ui
 # GASL conversion using nodejs_webapp_cicd template (Angular, npm, Docker, Helm, K8s)
 # All actions pinned to required SHAs
+
 # Jobs mirror Jenkins stages 1-to-1 in a strict sequential chain — every stage is visible
 # in the GitHub Actions sidebar, matching what is shown in the Jenkins pipeline view.
 
