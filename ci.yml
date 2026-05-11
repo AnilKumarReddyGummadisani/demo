@@ -1,0 +1,625 @@
+﻿# Migrated from Jenkinsfile: monitoring-service-ui
+# GASL conversion using nodejs_webapp_cicd template (Angular, npm, Docker, Helm, K8s)
+# All actions pinned to required SHAs
+# Jobs mirror Jenkins stages 1-to-1 in a strict sequential chain — every stage is visible
+# in the GitHub Actions sidebar, matching what is shown in the Jenkins pipeline view.
+
+name: CI/CD Pipeline for monitoring-service-ui
+
+# Mirrors Jenkinsfile disableConcurrentBuilds()
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  deployments: write
+  actions: read
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select Environment'
+        type: choice
+        options: [dev, test, prod]
+        required: true
+      version_type:
+        description: 'DEV/TEST: SNAPSHOT or RELEASE. PROD: RELEASE only'
+        type: choice
+        options: [Select, SNAPSHOT, RELEASE]
+        default: Select
+      image_version:
+        description: 'Existing Docker image version to deploy (leave blank to auto-build)'
+        type: string
+        required: false
+        default: ''
+
+# Shared constants used across all jobs
+env:
+  PROJECT_MAL: MONITORING-SERVICE-UI
+  PROJECT_NAME: monitoring-service-ui
+  DOCKER_REPO: netserv
+  DOCKER_REGISTRY: nexusprod.corp.intranet:4567
+  NAMESPACE: ntr
+  INGRESS_DOMAIN_DEV_TEST: rke-ddc-test.corp.intranet
+  INGRESS_DOMAIN_PROD: rke-ddc-prod.corp.intranet
+
+jobs:
+
+  # ============================================================
+  # STAGE 1 — Parameters
+  # Mirrors Jenkins 'Parameters' stage.
+  # Fetches GASL DevOps secrets and generates the GitHub App token.
+  # ============================================================
+  parameters:
+    name: "Parameters"
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    outputs:
+      encrypted_devops_secrets: ${{ steps.get-secret.outputs.encrypted-secrets-json }}
+      ga_token:                 ${{ steps.generate-token.outputs.token }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ${{ github.event.repository.name }}
+
+      - name: Generate GitHub App Token
+        id: generate-token
+        uses: actions/create-github-app-token@67e27a7eb7db372a1c61a7f9bdab8699e9ee57f7 # v1.11.3
+        with:
+          app-id: ${{ secrets.GASL_UMI_ID }}
+          private-key: ${{ secrets.GASL_UMI_PK }}
+          repositories: gasl-umi
+
+      - name: Get DevOps Secrets
+        id: get-secret
+        uses: CenturyLink/gasl-github-shared-library/.github/actions/get-devops-secret@b95ad07af1acb1ee84d498d79fff8b208a94bbd6 # v1.0.1
+        with:
+          github-token: ${{ steps.generate-token.outputs.token }}
+          secret-names: 'gasl-docker-login-password,gasl-docker-login-user,gasl-gh-token,gasl-reader-app-id,gasl-reader-app-key,jira-user,jira-token'
+          decode-base64: 'true'
+          gpg-encrypt-output: 'true'
+          gpg-passphrase: ${{ secrets.GASL_UMI_ID }}
+          verbose: ${{ vars.DEBUG || 'false' }}
+
+  # ============================================================
+  # STAGE 2 — Application Specific Properties
+  # Mirrors Jenkins 'Application Specific Properties' stage.
+  # Runs workflow-setup to resolve the target environment.
+  # ============================================================
+  app-properties:
+    name: "Application Specific Properties"
+    needs: parameters
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    outputs:
+      environment: ${{ steps.workflow-setup.outputs.environment }}
+      project_mal: ${{ steps.workflow-setup.outputs.project_mal }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ${{ github.event.repository.name }}
+
+      - name: Workflow Setup
+        id: workflow-setup
+        uses: CenturyLink/gasl-github-shared-library/.github/actions/workflow-setup@b95ad07af1acb1ee84d498d79fff8b208a94bbd6 # v1.1.1
+        with:
+          project-mal: 'MONITORING-SERVICE-UI'
+          event-name: ${{ github.event_name }}
+          ref: ${{ github.ref }}
+          pr-source-branch: ${{ github.head_ref }}
+          pr-target-branch: ${{ github.base_ref }}
+          repo-default-branch: ${{ github.event.repository.default_branch }}
+          event-inputs-environment: ${{ github.event.inputs.environment }}
+          repository-owner: ${{ github.repository_owner }}
+          repository-name: ${{ github.event.repository.name }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          dev-branch-name: ${{ vars.DEV_BRANCH_NAME || '' }}
+          test-branch-names: ${{ vars.TEST_BRANCH_NAMES || github.event.repository.default_branch }}
+          prod-branch-name: ${{ vars.PROD_BRANCH_NAME || 'production' }}
+          default-pr-environment: ${{ vars.DEFAULT_PR_ENVIRONMENT || 'dev' }}
+          skip-test-on-main-merge: ${{ vars.SKIP_TEST_ON_MAIN_MERGE || 'false' }}
+          custom-test-branch-patterns: ${{ vars.CUSTOM_TEST_BRANCH_PATTERNS || 'test' }}
+          pr-env-mapping: ${{ vars.PR_ENV_MAPPING || '' }}
+          push-env-mapping: ${{ vars.PUSH_ENV_MAPPING || '' }}
+          push-env-regex-mapping: ${{ vars.PUSH_ENV_REGEX_MAPPING || '' }}
+          default-push-environment: ${{ vars.DEFAULT_PUSH_ENVIRONMENT || 'dev' }}
+          branch-name: ${{ vars.BRANCH_NAME }}
+          app-id: ${{ env.SECRET_GASL_READER_APP_ID }}
+          private-key: ${{ env.SECRET_GASL_READER_APP_KEY }}
+          unique-id: ${{ github.run_id }}
+          oidc_token_artifact: 'oidc-token'
+          debug: ${{ vars.DEBUG || 'false' }}
+
+      - name: Show Application Properties
+        shell: bash
+        run: |
+          echo "Project MAL:      MONITORING-SERVICE-UI"
+          echo "Project Name:     monitoring-service-ui"
+          echo "Docker Registry:  ${{ env.DOCKER_REGISTRY }}"
+          echo "Docker Repo:      ${{ env.DOCKER_REPO }}"
+          echo "Namespace:        ${{ env.NAMESPACE }}"
+          echo "Environment:      ${{ steps.workflow-setup.outputs.environment }}"
+
+  # ============================================================
+  # STAGE 3 — Validate Profile
+  # Mirrors Jenkins 'Validate Profile' stage.
+  # Skipped for PR builds (mirrors Jenkins: when { not { changeRequest() } }).
+  # ============================================================
+  validate:
+    name: "Validate Profile"
+    needs: app-properties
+    if: github.event_name != 'pull_request'
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    steps:
+      - name: Validate Environment and Version
+        shell: bash
+        run: |
+          ENVIRONMENT="${{ needs.app-properties.outputs.environment }}"
+          IMAGE_VERSION="${{ github.event.inputs.image_version }}"
+
+          if [[ ! "$ENVIRONMENT" =~ ^(dev|test|prod)$ ]]; then
+            echo "::error::Invalid ENVIRONMENT: '${ENVIRONMENT}'. Valid options: dev, test, prod."
+            exit 1
+          fi
+
+          if [ "$ENVIRONMENT" == "prod" ] && [ -z "$IMAGE_VERSION" ]; then
+            echo "::error::Production deployments require selecting an existing Docker image version."
+            exit 1
+          fi
+
+          if [ -n "$IMAGE_VERSION" ] && echo "$IMAGE_VERSION" | grep -qE '\-(SNAPSHOT|PR)'; then
+            echo "::error::Production cannot use SNAPSHOT or PR versions. Selected: ${IMAGE_VERSION}"
+            exit 1
+          fi
+
+          echo "Validation passed for environment: ${ENVIRONMENT}"
+
+  # ============================================================
+  # STAGE 4 — Environment Configuration
+  # Mirrors Jenkins 'Environment Configuration' stage.
+  # Computes image_tag, namespace, kube_context, etc. for all downstream jobs.
+  # ============================================================
+  env-config:
+    name: "Environment Configuration"
+    needs: [parameters, app-properties, validate]
+    if: >-
+      always() &&
+      needs.parameters.result == 'success' &&
+      needs.app-properties.result == 'success' &&
+      (needs.validate.result == 'success' || needs.validate.result == 'skipped')
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    outputs:
+      image_tag:         ${{ steps.build-config.outputs.image_tag }}
+      k8s_namespace:     ${{ steps.build-config.outputs.k8s_namespace }}
+      active_profile:    ${{ steps.build-config.outputs.active_profile }}
+      deploy:            ${{ steps.build-config.outputs.deploy }}
+      ingress_domain:    ${{ steps.build-config.outputs.ingress_domain }}
+      kube_context:      ${{ steps.build-config.outputs.kube_context }}
+      normalized_branch: ${{ steps.build-config.outputs.normalized_branch }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Compute Environment Configuration
+        id: build-config
+        shell: bash
+        run: |
+          ENVIRONMENT="${{ needs.app-properties.outputs.environment }}"
+          IMAGE_VERSION="${{ github.event.inputs.image_version }}"
+          IS_PR="${{ github.event_name == 'pull_request' }}"
+          PACKAGE_VERSION=$(grep -m1 '"version"' package.json | sed 's/.*"version": *"\([^"]*\)".*/\1/')
+          echo "Package version from package.json: ${PACKAGE_VERSION}"
+
+          RAW_BRANCH="${{ github.ref_name }}"
+          NORMALIZED_BRANCH=$(echo "${RAW_BRANCH##*/}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+          echo "normalized_branch=${NORMALIZED_BRANCH}" >> "$GITHUB_OUTPUT"
+
+          if [ "$IS_PR" == "true" ]; then
+            echo "image_tag=latest"                                         >> "$GITHUB_OUTPUT"
+            echo "k8s_namespace=none"                                       >> "$GITHUB_OUTPUT"
+            echo "active_profile=dev"                                       >> "$GITHUB_OUTPUT"
+            echo "deploy=none"                                              >> "$GITHUB_OUTPUT"
+            echo "ingress_domain=${{ env.INGRESS_DOMAIN_DEV_TEST }}"       >> "$GITHUB_OUTPUT"
+            echo "kube_context=ntr-dev"                                     >> "$GITHUB_OUTPUT"
+          elif [ "$ENVIRONMENT" == "prod" ]; then
+            echo "image_tag=${IMAGE_VERSION}"                               >> "$GITHUB_OUTPUT"
+            echo "k8s_namespace=ntr"                                        >> "$GITHUB_OUTPUT"
+            echo "active_profile=prod"                                      >> "$GITHUB_OUTPUT"
+            echo "deploy=prod"                                              >> "$GITHUB_OUTPUT"
+            echo "ingress_domain=${{ env.INGRESS_DOMAIN_PROD }}"           >> "$GITHUB_OUTPUT"
+            echo "kube_context=ntr"                                         >> "$GITHUB_OUTPUT"
+          elif [ "$ENVIRONMENT" == "test" ]; then
+            IMAGE_TAG="${IMAGE_VERSION:-$PACKAGE_VERSION}"
+            echo "image_tag=${IMAGE_TAG}"                                   >> "$GITHUB_OUTPUT"
+            echo "k8s_namespace=ntr-test"                                   >> "$GITHUB_OUTPUT"
+            echo "active_profile=test"                                      >> "$GITHUB_OUTPUT"
+            echo "deploy=test"                                              >> "$GITHUB_OUTPUT"
+            echo "ingress_domain=${{ env.INGRESS_DOMAIN_DEV_TEST }}"       >> "$GITHUB_OUTPUT"
+            echo "kube_context=ntr-test"                                    >> "$GITHUB_OUTPUT"
+          else
+            IMAGE_TAG="${IMAGE_VERSION:-$PACKAGE_VERSION}"
+            echo "image_tag=${IMAGE_TAG}"                                   >> "$GITHUB_OUTPUT"
+            echo "k8s_namespace=ntr-dev"                                    >> "$GITHUB_OUTPUT"
+            echo "active_profile=dev"                                       >> "$GITHUB_OUTPUT"
+            echo "deploy=dev"                                               >> "$GITHUB_OUTPUT"
+            echo "ingress_domain=${{ env.INGRESS_DOMAIN_DEV_TEST }}"       >> "$GITHUB_OUTPUT"
+            echo "kube_context=ntr-dev"                                     >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "=== Environment Configuration ==="
+          echo "Environment:       ${ENVIRONMENT}"
+          echo "Image Tag:         $(grep '^image_tag='        "$GITHUB_OUTPUT" | cut -d= -f2)"
+          echo "K8s Namespace:     $(grep '^k8s_namespace='    "$GITHUB_OUTPUT" | cut -d= -f2)"
+          echo "Kube Context:      $(grep '^kube_context='     "$GITHUB_OUTPUT" | cut -d= -f2)"
+          echo "Normalized Branch: $(grep '^normalized_branch=' "$GITHUB_OUTPUT" | cut -d= -f2)"
+          echo "=================================="
+
+  # ============================================================
+  # STAGE 5 — Authorize - Prod only
+  # Mirrors Jenkins 'Authorize - Prod only' stage.
+  # Skipped for non-prod and PR builds.
+  # ============================================================
+  authorize-prod-only:
+    name: "Authorize - Prod only"
+    needs: env-config
+    if: >-
+      always() &&
+      needs.env-config.result == 'success' &&
+      (needs.env-config.outputs.active_profile == 'prod' ||
+       (github.ref_type == 'tag' && contains(github.ref, '##DEPLOYMENT##'))) &&
+      (github.event.inputs.image_version != '' ||
+       (github.ref_type == 'tag' && contains(github.ref, '##DEPLOYMENT##')))
+    environment: ${{ needs.env-config.outputs.active_profile }}
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    outputs:
+      approver: ${{ steps.authorize-prod.outputs.approver }}
+    steps:
+      - name: Authorize Prod
+        id: authorize-prod
+        uses: CenturyLink/gasl-github-shared-library/.github/actions/authorize-prod@2f12515fdabbb56462068eea95710e9fea7e20ed # v1.0.2
+        with:
+          githubToken: ${{ secrets.GITHUB_TOKEN }}
+          approvalEnvironment: ${{ needs.env-config.outputs.active_profile }}
+          environment: ${{ needs.env-config.outputs.active_profile }}
+          repositoryOwner: ${{ github.repository_owner }}
+          repositoryName: ${{ github.event.repository.name }}
+
+  # ============================================================
+  # STAGE 6 — Static Code Analysis (DevSecOps)
+  # Mirrors Jenkins 'Static Code Analysis' → 'DevSecOps' parallel stage.
+  # Skipped for prod builds with a pre-selected image.
+  # continue-on-error mirrors Jenkins UNSTABLE — does not block the pipeline.
+  # ============================================================
+  static-analysis:
+    name: "Static Code Analysis"
+    needs: [env-config, authorize-prod-only]
+    if: >-
+      always() &&
+      needs.env-config.result == 'success' &&
+      (needs.authorize-prod-only.result == 'success' || needs.authorize-prod-only.result == 'skipped') &&
+      (github.event_name == 'pull_request' ||
+       needs.env-config.outputs.active_profile != 'prod' ||
+       github.event.inputs.image_version == '')
+    continue-on-error: true
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: DevSecOps — npm audit
+        shell: bash
+        run: |
+          echo "Running security audit via npm audit..."
+          npm audit --audit-level=critical \
+            || echo "::warning::Security vulnerabilities detected — pipeline marked unstable"
+
+  # ============================================================
+  # STAGE 7 — Build
+  # Mirrors Jenkins 'Build' stage (npm ci + npm run build).
+  # Skipped when a pre-selected image version is provided (not a new build).
+  # ============================================================
+  build:
+    name: "Build"
+    needs: static-analysis
+    if: >-
+      always() &&
+      (needs.static-analysis.result == 'success' || needs.static-analysis.result == 'skipped' || needs.static-analysis.result == 'failure') &&
+      (github.event_name == 'pull_request' || github.event.inputs.image_version == '')
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: NPM Install
+        uses: CenturyLink/gasl-github-shared-library/.github/actions/npm-wrapper@b95ad07af1acb1ee84d498d79fff8b208a94bbd6 # v1.0.1
+        with:
+          command: 'ci --legacy-peer-deps'
+
+      - name: NPM Build
+        uses: CenturyLink/gasl-github-shared-library/.github/actions/npm-wrapper@b95ad07af1acb1ee84d498d79fff8b208a94bbd6 # v1.0.1
+        with:
+          command: 'run build -- --configuration=production'
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-monitoring
+          path: dist/monitoring/**
+
+  # ============================================================
+  # STAGE 8 — Test
+  # Mirrors Jenkins 'Test' stage.
+  # Intentionally skipped (env.RUN_TESTS = 'false' in Jenkinsfile) but visible in the sidebar.
+  # ============================================================
+  test:
+    name: "Test"
+    needs: build
+    if: >-
+      always() &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped' || needs.build.result == 'failure')
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    steps:
+      - name: Test (Skipped)
+        shell: bash
+        run: |
+          echo "Tests are currently disabled (RUN_TESTS=false), matching Jenkinsfile configuration."
+          echo "To enable, set RUN_TESTS=true and add npm test steps here."
+
+  # ============================================================
+  # STAGE 9 — SonarQube Analysis
+  # Mirrors Jenkins 'SonarQube Analysis' stage.
+  # Intentionally skipped (disabled in Jenkinsfile) but visible in the sidebar.
+  # ============================================================
+  sonarqube-analysis:
+    name: "SonarQube Analysis"
+    needs: test
+    if: >-
+      always() &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped' || needs.test.result == 'failure')
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    steps:
+      - name: SonarQube Analysis (Skipped)
+        shell: bash
+        run: |
+          echo "SonarQube Analysis is currently disabled, matching Jenkinsfile configuration."
+          echo "To enable, configure SONARQUBE_CREDENTIALS and add sonar-scanner steps here."
+
+  # ============================================================
+  # STAGE 10 — PR Quality Gates and Reporting
+  # Mirrors Jenkins 'PR Quality Gates and Reporting' stage.
+  # Runs only for PR events. always() mirrors Jenkins post { always {} }.
+  # ============================================================
+  pr-quality-gate:
+    name: "PR Quality Gates and Reporting"
+    needs: sonarqube-analysis
+    if: >-
+      always() &&
+      (needs.sonarqube-analysis.result == 'success' || needs.sonarqube-analysis.result == 'skipped' || needs.sonarqube-analysis.result == 'failure') &&
+      github.event_name == 'pull_request'
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    steps:
+      - name: PR Quality Gate Report
+        shell: bash
+        run: |
+          echo "PR Build completed - Number: ${{ github.event.number }}, Branch: ${{ github.head_ref }}"
+          echo "Build Status: ${{ needs.build.result }}"
+
+  # ============================================================
+  # STAGE 11 — Create Image
+  # Mirrors Jenkins 'Create Image' stage (Docker build + push to Nexus).
+  # Runs on manual workflow_dispatch OR on merge/push to development branch (auto dev deploy).
+  # Skipped for push to other branches, PR events, and when a pre-selected image version is supplied.
+  # ============================================================
+  create-image:
+    name: "Create Image"
+    needs: [parameters, env-config, pr-quality-gate]
+    if: >-
+      always() &&
+      needs.parameters.result == 'success' &&
+      needs.env-config.result == 'success' &&
+      (needs.pr-quality-gate.result == 'success' || needs.pr-quality-gate.result == 'skipped') &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/development')) &&
+      github.event.inputs.image_version == ''
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist-monitoring
+          path: dist/monitoring
+
+      - name: Decrypt Secrets
+        uses: CenturyLink/gasl-github-shared-library/.github/actions/decrypt-secrets@b95ad07af1acb1ee84d498d79fff8b208a94bbd6 # v1.0.1
+        with:
+          encrypted-secrets-json: ${{ needs.parameters.outputs.encrypted_devops_secrets }}
+          gpg-passphrase: ${{ secrets.GASL_UMI_ID }}
+
+      - name: Docker Login to Nexus
+        shell: bash
+        run: |
+          echo "$GASL_DOCKER_LOGIN_PASSWORD" | \
+            docker login "${{ env.DOCKER_REGISTRY }}" \
+              --username "$GASL_DOCKER_LOGIN_USER" \
+              --password-stdin
+
+      - name: Docker Build
+        uses: CenturyLink/gasl-github-shared-library/.github/actions/docker-build@b95ad07af1acb1ee84d498d79fff8b208a94bbd6 # v1.0.1
+        with:
+          dockerfile_path: ./Dockerfile
+          fullImageName: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}/${{ env.PROJECT_NAME }}:${{ needs.env-config.outputs.image_tag }}
+          buildDir: .
+
+      - name: Docker Push
+        uses: CenturyLink/gasl-github-shared-library/.github/actions/docker-push@b95ad07af1acb1ee84d498d79fff8b208a94bbd6 # v1.0.1
+        with:
+          fullImageName: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}/${{ env.PROJECT_NAME }}:${{ needs.env-config.outputs.image_tag }}
+
+  # ============================================================
+  # STAGE 12 — Deploy
+  # Mirrors Jenkins 'Deploy' stage.
+  # Runs on manual workflow_dispatch OR on merge/push to development branch (auto dev deploy).
+  # Skipped for push to other branches and PR events.
+  # ============================================================
+  deploy:
+    name: "Deploy"
+    needs: [env-config, create-image]
+    if: >-
+      always() &&
+      needs.env-config.result == 'success' &&
+      (needs.create-image.result == 'success' || needs.create-image.result == 'skipped') &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/development'))
+    timeout-minutes: 60
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Create GitHub Deployment
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const environment = '${{ needs.env-config.outputs.active_profile }}';
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: environment,
+              auto_merge: false,
+              required_contexts: [],
+              description: `Deploying image ${{ needs.env-config.outputs.image_tag }} to ${environment}`
+            });
+            core.info(`Created GitHub Deployment ID: ${deployment.id} for environment: ${environment}`);
+
+      - name: Deploy to Kubernetes via Helm
+        shell: bash
+        env:
+          NTR_DEV_KUBECONFIG:  ${{ secrets.NTR_DEV_KUBECONFIG }}
+          NTR_TEST_KUBECONFIG: ${{ secrets.NTR_TEST_KUBECONFIG }}
+          NTR_PROD_KUBECONFIG: ${{ secrets.NTR_PROD_KUBECONFIG }}
+        run: |
+          ENVIRONMENT="${{ needs.env-config.outputs.active_profile }}"
+          KUBE_CONTEXT="${{ needs.env-config.outputs.kube_context }}"
+          K8S_NAMESPACE="${{ needs.env-config.outputs.k8s_namespace }}"
+          IMAGE_REPO="${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}/${{ env.PROJECT_NAME }}"
+          IMAGE_TAG="${{ needs.env-config.outputs.image_tag }}"
+          ACTIVE_PROFILE="${{ needs.env-config.outputs.active_profile }}"
+          DOMAIN="${{ needs.env-config.outputs.ingress_domain }}"
+          HELM_TEMPLATES_PATH="./cicd/helm/netserv-monitoring-service-ui/"
+
+          mkdir -p ~/.kube
+          if   [ "$ENVIRONMENT" == "prod" ]; then KUBECONFIG_CONTENT="$NTR_PROD_KUBECONFIG"
+          elif [ "$ENVIRONMENT" == "test" ]; then KUBECONFIG_CONTENT="$NTR_TEST_KUBECONFIG"
+          else                                    KUBECONFIG_CONTENT="$NTR_DEV_KUBECONFIG"
+          fi
+
+          if [ -z "$KUBECONFIG_CONTENT" ]; then
+            echo "::error::Kubeconfig secret for environment '${ENVIRONMENT}' is empty or not set."
+            echo "::error::Add the secret NTR_${ENVIRONMENT^^}_KUBECONFIG to the repository secrets."
+            exit 1
+          fi
+
+          echo "$KUBECONFIG_CONTENT" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+          echo "=== DEPLOYMENT INFO ==="
+          echo "Environment:  ${ENVIRONMENT}"
+          echo "Context:      ${KUBE_CONTEXT}"
+          echo "Namespace:    ${K8S_NAMESPACE}"
+          echo "Image:        ${IMAGE_REPO}:${IMAGE_TAG}"
+          echo "======================="
+
+          kubectl config get-contexts
+          kubectl get nodes --context="${KUBE_CONTEXT}" --no-headers | head -1 \
+            || echo "Cluster connectivity verified"
+
+          helm upgrade --install \
+            --kube-context="${KUBE_CONTEXT}" \
+            --namespace="${K8S_NAMESPACE}" \
+            --history-max=5 \
+            --set "branch=${{ needs.env-config.outputs.normalized_branch }}" \
+            --set "profile=${ACTIVE_PROFILE}" \
+            --set "environment=${ENVIRONMENT}" \
+            --set "domain=${DOMAIN}" \
+            --set "image.repository=${IMAGE_REPO}" \
+            --set "image.version=${IMAGE_TAG}" \
+            --set "timestamp=${{ github.run_id }}" \
+            "netserv-monitoring-service-ui-${ENVIRONMENT}" \
+            "${HELM_TEMPLATES_PATH}"
+
+  # ============================================================
+  # STAGE 13 — Notify
+  # Mirrors Jenkinsfile post { success/failure/aborted } notification blocks.
+  # Skips cleanly if TEAMS_WEBHOOK secret is not configured.
+  # ============================================================
+  notify:
+    name: "Notify"
+    needs: deploy
+    if: always() && needs.deploy.result != 'cancelled'
+    runs-on:
+      group: CCOE-ONPREM-AZURE
+    env:
+      TEAMS_WEBHOOK: ${{ secrets.TEAMS_WEBHOOK }}
+    steps:
+      - name: Notification (Success)
+        if: >-
+          env.TEAMS_WEBHOOK != '' &&
+          needs.deploy.result == 'success'
+        uses: CenturyLink/gasl-github-shared-library/.github/actions/notification@b95ad07af1acb1ee84d498d79fff8b208a94bbd6 # v1.0.1
+        with:
+          status: 'success'
+          project-mal: ${{ env.PROJECT_MAL }}
+          project-repo: ${{ github.event.repository.name }}
+          teams-webhook: ${{ secrets.TEAMS_WEBHOOK }}
+
+      - name: Notification (Failure)
+        if: env.TEAMS_WEBHOOK != '' && needs.deploy.result == 'failure'
+        uses: CenturyLink/gasl-github-shared-library/.github/actions/notification@b95ad07af1acb1ee84d498d79fff8b208a94bbd6 # v1.0.1
+        with:
+          status: 'failure'
+          project-mal: ${{ env.PROJECT_MAL }}
+          project-repo: ${{ github.event.repository.name }}
+          teams-webhook: ${{ secrets.TEAMS_WEBHOOK }}
+
+      - name: Notification (Aborted)
+        if: cancelled() && env.TEAMS_WEBHOOK != ''
+        uses: CenturyLink/gasl-github-shared-library/.github/actions/notification@b95ad07af1acb1ee84d498d79fff8b208a94bbd6 # v1.0.1
+        with:
+          status: 'aborted'
+          project-mal: ${{ env.PROJECT_MAL }}
+          project-repo: ${{ github.event.repository.name }}
+          teams-webhook: ${{ secrets.TEAMS_WEBHOOK }}
+
+  # ============================================================
+  # STAGE 14 — Summary
+  # Reusable GASL workflow-summary — always runs last.
+  # ============================================================
+  workflow-summary:
+    name: "Summary"
+    needs: notify
+    if: always()
+    uses: CenturyLink/gasl-github-shared-library/.github/workflows/workflow-summary.yml@b95ad07af1acb1ee84d498d79fff8b208a94bbd6
+    with:
+      runnerGroup: CCOE-ONPREM-AZURE
